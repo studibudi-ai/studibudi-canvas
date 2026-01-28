@@ -1,13 +1,11 @@
 import React, { useState, useCallback, useRef } from 'react'
-import { DrawingCanvas } from './DrawingCanvas'
+import { DrawingCanvas, DrawingCanvasHandle } from './DrawingCanvas'
 import { Toolbar } from './Toolbar'
 import { PromptInput } from './PromptInput'
-import { AIGenerator } from '../services/AIGenerator'
 import type { 
   InteractiveBoardProps, 
   CanvasState, 
   DrawingTool,
-  DrawingStroke,
   AIGeneratedImage
 } from '../types'
 import './InteractiveBoard.css'
@@ -22,109 +20,110 @@ const defaultState: CanvasState = {
 
 export const InteractiveBoard: React.FC<InteractiveBoardProps> = ({
   width = 800,
-  height = 600,
+  height = 500,
   backgroundColor = '#ffffff',
   aiConfig,
   onChange,
   onSave,
   onAIGenerate,
   enableVoice = true,
-  className = '',
-  initialState
+  className = ''
 }) => {
-  const [canvasState, setCanvasState] = useState<CanvasState>(
-    initialState || { ...defaultState, width, height, backgroundColor }
-  )
+  const [canvasState, setCanvasState] = useState<CanvasState>({
+    ...defaultState, 
+    width, 
+    height, 
+    backgroundColor
+  })
   const [activeTool, setActiveTool] = useState<DrawingTool>('pen')
   const [activeColor, setActiveColor] = useState('#000000')
   const [strokeWidth, setStrokeWidth] = useState(3)
   const [isGenerating, setIsGenerating] = useState(false)
-  const [history, setHistory] = useState<CanvasState[]>([])
-  const [historyIndex, setHistoryIndex] = useState(-1)
   
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const aiGenerator = useRef(aiConfig ? new AIGenerator(aiConfig) : null)
-
-  const updateState = useCallback((newState: CanvasState) => {
-    setCanvasState(newState)
-    // Add to history for undo/redo
-    setHistory(prev => [...prev.slice(0, historyIndex + 1), newState])
-    setHistoryIndex(prev => prev + 1)
-    onChange?.(newState)
-  }, [historyIndex, onChange])
-
-  const handleStrokeComplete = useCallback((stroke: DrawingStroke) => {
-    const newState = {
-      ...canvasState,
-      strokes: [...canvasState.strokes, stroke]
-    }
-    updateState(newState)
-  }, [canvasState, updateState])
+  const canvasRef = useRef<DrawingCanvasHandle>(null)
 
   const handlePromptSubmit = useCallback(async (prompt: string) => {
-    if (!aiGenerator.current) {
-      console.warn('AI generator not configured')
+    if (!aiConfig?.apiKey) {
+      console.warn('AI not configured - showing placeholder')
+      // For demo, add a placeholder colored rectangle
+      const aiImage: AIGeneratedImage = {
+        id: crypto.randomUUID(),
+        prompt,
+        imageUrl: createPlaceholderImage(prompt),
+        position: { x: width / 2 - 100, y: height / 2 - 75 },
+        width: 200,
+        height: 150,
+        timestamp: new Date()
+      }
+      
+      setCanvasState(prev => ({
+        ...prev,
+        aiGeneratedImages: [...prev.aiGeneratedImages, aiImage]
+      }))
+      onAIGenerate?.(aiImage)
       return
     }
 
     setIsGenerating(true)
     try {
-      const image = await aiGenerator.current.generate(prompt)
+      const imageUrl = await generateWithAI(prompt, aiConfig)
       const aiImage: AIGeneratedImage = {
         id: crypto.randomUUID(),
         prompt,
-        imageUrl: image,
+        imageUrl,
         position: { x: width / 2 - 100, y: height / 2 - 100 },
         width: 200,
         height: 200,
         timestamp: new Date()
       }
       
-      const newState = {
-        ...canvasState,
-        aiGeneratedImages: [...canvasState.aiGeneratedImages, aiImage]
-      }
-      updateState(newState)
+      setCanvasState(prev => ({
+        ...prev,
+        aiGeneratedImages: [...prev.aiGeneratedImages, aiImage]
+      }))
       onAIGenerate?.(aiImage)
     } catch (error) {
       console.error('AI generation failed:', error)
     } finally {
       setIsGenerating(false)
     }
-  }, [canvasState, updateState, onAIGenerate, width, height])
+  }, [aiConfig, width, height, onAIGenerate])
 
   const handleUndo = useCallback(() => {
-    if (historyIndex > 0) {
-      setHistoryIndex(prev => prev - 1)
-      setCanvasState(history[historyIndex - 1])
-    }
-  }, [history, historyIndex])
+    canvasRef.current?.undo()
+  }, [])
 
   const handleRedo = useCallback(() => {
-    if (historyIndex < history.length - 1) {
-      setHistoryIndex(prev => prev + 1)
-      setCanvasState(history[historyIndex + 1])
-    }
-  }, [history, historyIndex])
+    canvasRef.current?.redo()
+  }, [])
 
   const handleClear = useCallback(() => {
-    const newState = {
-      ...canvasState,
+    canvasRef.current?.clear()
+    setCanvasState(prev => ({
+      ...prev,
       strokes: [],
       aiGeneratedImages: []
-    }
-    updateState(newState)
-  }, [canvasState, updateState])
+    }))
+  }, [])
 
   const handleSave = useCallback(() => {
-    if (canvasRef.current) {
-      const dataUrl = canvasRef.current.toDataURL('image/png')
-      onSave?.(dataUrl, canvasState)
-    }
+    const dataUrl = canvasRef.current?.toDataURL() || ''
+    onSave?.(dataUrl, canvasState)
+    
+    // Also trigger download
+    const link = document.createElement('a')
+    link.download = `studibudi-canvas-${Date.now()}.png`
+    link.href = dataUrl
+    link.click()
   }, [canvasState, onSave])
 
   return (
     <div className={`studibudi-canvas-container ${className}`}>
+      <div className="canvas-header">
+        <h2>🎨 StudiBudi Canvas</h2>
+        <span className="canvas-subtitle">Draw or describe what you want!</span>
+      </div>
+      
       <Toolbar
         activeTool={activeTool}
         onToolChange={setActiveTool}
@@ -135,8 +134,8 @@ export const InteractiveBoard: React.FC<InteractiveBoardProps> = ({
         onUndo={handleUndo}
         onRedo={handleRedo}
         onClear={handleClear}
-        canUndo={historyIndex > 0}
-        canRedo={historyIndex < history.length - 1}
+        canUndo={true}
+        canRedo={true}
       />
       
       <DrawingCanvas
@@ -147,9 +146,7 @@ export const InteractiveBoard: React.FC<InteractiveBoardProps> = ({
         tool={activeTool}
         color={activeColor}
         strokeWidth={strokeWidth}
-        strokes={canvasState.strokes}
         aiImages={canvasState.aiGeneratedImages}
-        onStrokeComplete={handleStrokeComplete}
       />
       
       <PromptInput
@@ -160,11 +157,77 @@ export const InteractiveBoard: React.FC<InteractiveBoardProps> = ({
       
       <div className="canvas-actions">
         <button onClick={handleSave} className="save-btn">
-          💾 Save
+          💾 Save Drawing
         </button>
       </div>
     </div>
   )
+}
+
+// Placeholder image generator for demo
+function createPlaceholderImage(prompt: string): string {
+  const canvas = document.createElement('canvas')
+  canvas.width = 200
+  canvas.height = 150
+  const ctx = canvas.getContext('2d')!
+  
+  // Random gradient background
+  const colors = ['#ff6b6b', '#4ecdc4', '#45b7d1', '#96ceb4', '#ffeaa7', '#dfe6e9', '#a29bfe']
+  const color1 = colors[Math.floor(Math.random() * colors.length)]
+  const color2 = colors[Math.floor(Math.random() * colors.length)]
+  
+  const gradient = ctx.createLinearGradient(0, 0, 200, 150)
+  gradient.addColorStop(0, color1)
+  gradient.addColorStop(1, color2)
+  
+  ctx.fillStyle = gradient
+  ctx.fillRect(0, 0, 200, 150)
+  
+  // Add text
+  ctx.fillStyle = '#ffffff'
+  ctx.font = 'bold 14px Arial'
+  ctx.textAlign = 'center'
+  ctx.shadowColor = 'rgba(0,0,0,0.5)'
+  ctx.shadowBlur = 4
+  
+  const words = prompt.split(' ').slice(0, 4).join(' ')
+  ctx.fillText(words.length > 20 ? words.slice(0, 20) + '...' : words, 100, 75)
+  ctx.font = '10px Arial'
+  ctx.fillText('🤖 AI Placeholder', 100, 95)
+  
+  return canvas.toDataURL('image/png')
+}
+
+// AI generation function
+async function generateWithAI(prompt: string, config: NonNullable<InteractiveBoardProps['aiConfig']>): Promise<string> {
+  const { provider, apiKey, style = 'illustration' } = config
+  
+  const styledPrompt = `${prompt}. Style: ${style}, white background, centered.`
+  
+  if (provider === 'gemini') {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: `Generate an image: ${styledPrompt}` }] }],
+          generationConfig: { responseModalities: ['image', 'text'] }
+        })
+      }
+    )
+    
+    const data = await response.json()
+    const imagePart = data.candidates?.[0]?.content?.parts?.find(
+      (p: any) => p.inlineData?.mimeType?.startsWith('image/')
+    )
+    
+    if (imagePart?.inlineData) {
+      return `data:${imagePart.inlineData.mimeType};base64,${imagePart.inlineData.data}`
+    }
+  }
+  
+  throw new Error('AI generation failed')
 }
 
 export default InteractiveBoard

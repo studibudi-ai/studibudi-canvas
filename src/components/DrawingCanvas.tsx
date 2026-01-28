@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, forwardRef, useImperativeHandle, useState } from 'react'
-import type { DrawingTool, DrawingStroke, Point, AIGeneratedImage } from '../types'
+import * as fabric from 'fabric'
+import type { DrawingTool, AIGeneratedImage } from '../types'
 
 interface DrawingCanvasProps {
   width: number
@@ -8,155 +9,169 @@ interface DrawingCanvasProps {
   tool: DrawingTool
   color: string
   strokeWidth: number
-  strokes: DrawingStroke[]
   aiImages: AIGeneratedImage[]
-  onStrokeComplete: (stroke: DrawingStroke) => void
+  onReady?: (canvas: fabric.Canvas) => void
 }
 
-export const DrawingCanvas = forwardRef<HTMLCanvasElement, DrawingCanvasProps>(({
+export interface DrawingCanvasHandle {
+  canvas: fabric.Canvas | null
+  toDataURL: () => string
+  clear: () => void
+  undo: () => void
+  redo: () => void
+}
+
+export const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>(({
   width,
   height,
   backgroundColor,
   tool,
   color,
   strokeWidth,
-  strokes,
   aiImages,
-  onStrokeComplete
+  onReady
 }, ref) => {
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const [isDrawing, setIsDrawing] = useState(false)
-  const [currentPoints, setCurrentPoints] = useState<Point[]>([])
+  const fabricRef = useRef<fabric.Canvas | null>(null)
+  const [history, setHistory] = useState<string[]>([])
+  const [historyIndex, setHistoryIndex] = useState(-1)
+  const isDrawingRef = useRef(false)
 
-  useImperativeHandle(ref, () => canvasRef.current as HTMLCanvasElement)
-
-  // Redraw canvas when strokes or images change
+  // Initialize Fabric canvas
   useEffect(() => {
-    const canvas = canvasRef.current
+    if (!canvasRef.current || fabricRef.current) return
+
+    const canvas = new fabric.Canvas(canvasRef.current, {
+      width,
+      height,
+      backgroundColor,
+      isDrawingMode: true,
+      selection: false
+    })
+
+    // Configure brush
+    canvas.freeDrawingBrush = new fabric.PencilBrush(canvas)
+    canvas.freeDrawingBrush.color = color
+    canvas.freeDrawingBrush.width = strokeWidth
+
+    // Save initial state
+    const initialState = JSON.stringify(canvas.toJSON())
+    setHistory([initialState])
+    setHistoryIndex(0)
+
+    // Listen for path creation
+    canvas.on('path:created', () => {
+      saveState(canvas)
+    })
+
+    fabricRef.current = canvas
+    onReady?.(canvas)
+
+    return () => {
+      canvas.dispose()
+      fabricRef.current = null
+    }
+  }, [])
+
+  // Update brush settings
+  useEffect(() => {
+    const canvas = fabricRef.current
     if (!canvas) return
 
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
+    if (tool === 'eraser') {
+      canvas.isDrawingMode = true
+      canvas.freeDrawingBrush = new fabric.PencilBrush(canvas)
+      canvas.freeDrawingBrush.color = backgroundColor
+      canvas.freeDrawingBrush.width = strokeWidth * 3
+    } else if (tool === 'pen' || tool === 'brush') {
+      canvas.isDrawingMode = true
+      canvas.freeDrawingBrush = new fabric.PencilBrush(canvas)
+      canvas.freeDrawingBrush.color = color
+      canvas.freeDrawingBrush.width = tool === 'brush' ? strokeWidth * 2 : strokeWidth
+    } else if (tool === 'select') {
+      canvas.isDrawingMode = false
+      canvas.selection = true
+    }
+  }, [tool, color, strokeWidth, backgroundColor])
 
-    // Clear and set background
-    ctx.fillStyle = backgroundColor
-    ctx.fillRect(0, 0, width, height)
+  // Add AI images to canvas
+  useEffect(() => {
+    const canvas = fabricRef.current
+    if (!canvas || aiImages.length === 0) return
 
-    // Draw AI-generated images
-    aiImages.forEach(img => {
-      const image = new Image()
-      image.src = img.imageUrl
-      image.onload = () => {
-        ctx.drawImage(image, img.position.x, img.position.y, img.width, img.height)
-      }
+    const lastImage = aiImages[aiImages.length - 1]
+    
+    fabric.FabricImage.fromURL(lastImage.imageUrl).then((img) => {
+      img.set({
+        left: lastImage.position.x,
+        top: lastImage.position.y,
+        scaleX: lastImage.width / (img.width || 200),
+        scaleY: lastImage.height / (img.height || 200),
+        selectable: true
+      })
+      canvas.add(img)
+      canvas.renderAll()
+      saveState(canvas)
     })
+  }, [aiImages.length])
 
-    // Draw all strokes
-    strokes.forEach(stroke => {
-      drawStroke(ctx, stroke)
+  const saveState = (canvas: fabric.Canvas) => {
+    const json = JSON.stringify(canvas.toJSON())
+    setHistory(prev => {
+      const newHistory = prev.slice(0, historyIndex + 1)
+      return [...newHistory, json]
     })
-  }, [strokes, aiImages, backgroundColor, width, height])
-
-  const drawStroke = (ctx: CanvasRenderingContext2D, stroke: DrawingStroke) => {
-    if (stroke.points.length < 2) return
-
-    ctx.beginPath()
-    ctx.strokeStyle = stroke.tool === 'eraser' ? backgroundColor : stroke.color
-    ctx.lineWidth = stroke.width
-    ctx.lineCap = 'round'
-    ctx.lineJoin = 'round'
-
-    ctx.moveTo(stroke.points[0].x, stroke.points[0].y)
-    for (let i = 1; i < stroke.points.length; i++) {
-      ctx.lineTo(stroke.points[i].x, stroke.points[i].y)
-    }
-    ctx.stroke()
+    setHistoryIndex(prev => prev + 1)
   }
 
-  const getPointerPosition = (e: React.PointerEvent): Point => {
-    const canvas = canvasRef.current
-    if (!canvas) return { x: 0, y: 0 }
+  const undo = () => {
+    const canvas = fabricRef.current
+    if (!canvas || historyIndex <= 0) return
 
-    const rect = canvas.getBoundingClientRect()
-    return {
-      x: e.clientX - rect.left,
-      y: e.clientY - rect.top
-    }
+    const newIndex = historyIndex - 1
+    canvas.loadFromJSON(history[newIndex]).then(() => {
+      canvas.renderAll()
+      setHistoryIndex(newIndex)
+    })
   }
 
-  const handlePointerDown = (e: React.PointerEvent) => {
-    if (tool === 'select') return
-    
-    setIsDrawing(true)
-    const point = getPointerPosition(e)
-    setCurrentPoints([point])
+  const redo = () => {
+    const canvas = fabricRef.current
+    if (!canvas || historyIndex >= history.length - 1) return
 
-    // Draw initial point
-    const canvas = canvasRef.current
-    const ctx = canvas?.getContext('2d')
-    if (ctx) {
-      ctx.beginPath()
-      ctx.fillStyle = tool === 'eraser' ? backgroundColor : color
-      ctx.arc(point.x, point.y, strokeWidth / 2, 0, Math.PI * 2)
-      ctx.fill()
-    }
+    const newIndex = historyIndex + 1
+    canvas.loadFromJSON(history[newIndex]).then(() => {
+      canvas.renderAll()
+      setHistoryIndex(newIndex)
+    })
   }
 
-  const handlePointerMove = (e: React.PointerEvent) => {
-    if (!isDrawing || tool === 'select') return
+  const clear = () => {
+    const canvas = fabricRef.current
+    if (!canvas) return
 
-    const point = getPointerPosition(e)
-    setCurrentPoints(prev => [...prev, point])
-
-    // Draw line segment
-    const canvas = canvasRef.current
-    const ctx = canvas?.getContext('2d')
-    if (ctx && currentPoints.length > 0) {
-      const lastPoint = currentPoints[currentPoints.length - 1]
-      ctx.beginPath()
-      ctx.strokeStyle = tool === 'eraser' ? backgroundColor : color
-      ctx.lineWidth = strokeWidth
-      ctx.lineCap = 'round'
-      ctx.moveTo(lastPoint.x, lastPoint.y)
-      ctx.lineTo(point.x, point.y)
-      ctx.stroke()
-    }
+    canvas.clear()
+    canvas.backgroundColor = backgroundColor
+    canvas.renderAll()
+    saveState(canvas)
   }
 
-  const handlePointerUp = () => {
-    if (!isDrawing) return
-
-    setIsDrawing(false)
-    
-    if (currentPoints.length > 0) {
-      const stroke: DrawingStroke = {
-        id: crypto.randomUUID(),
-        points: currentPoints,
-        color,
-        width: strokeWidth,
-        tool
-      }
-      onStrokeComplete(stroke)
-    }
-    
-    setCurrentPoints([])
+  const toDataURL = () => {
+    return fabricRef.current?.toDataURL({ format: 'png' }) || ''
   }
+
+  useImperativeHandle(ref, () => ({
+    canvas: fabricRef.current,
+    toDataURL,
+    clear,
+    undo,
+    redo
+  }))
 
   return (
-    <canvas
-      ref={canvasRef}
-      width={width}
-      height={height}
-      className="drawing-canvas"
-      style={{ 
-        cursor: tool === 'eraser' ? 'cell' : 'crosshair',
-        touchAction: 'none'
-      }}
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={handlePointerUp}
-      onPointerLeave={handlePointerUp}
-    />
+    <div className="canvas-wrapper">
+      <canvas ref={canvasRef} />
+    </div>
   )
 })
 
